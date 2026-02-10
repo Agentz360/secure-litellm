@@ -9,8 +9,8 @@ from litellm.proxy._experimental.mcp_server import rest_endpoints
 from litellm.proxy._experimental.mcp_server.auth import (
     user_api_key_auth_mcp as auth_mcp,
 )
-from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy._types import NewMCPServerRequest, UserAPIKeyAuth
+from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.types.mcp import MCPAuth
 
 
@@ -76,7 +76,7 @@ def _route_has_dependency(route, dependency) -> bool:
 class TestExecuteWithMcpClient:
     @pytest.mark.asyncio
     async def test_redacts_stack_trace(self, monkeypatch):
-        def fake_create_client(*args, **kwargs):
+        async def fake_create_client(*args, **kwargs):
             return object()
 
         monkeypatch.setattr(
@@ -114,7 +114,7 @@ class TestExecuteWithMcpClient:
         def fake_build_stdio_env(server, raw_headers):
             return None
 
-        def fake_create_client(*args, **kwargs):
+        async def fake_create_client(*args, **kwargs):
             captured["extra_headers"] = kwargs.get("extra_headers")
             return object()
 
@@ -321,6 +321,7 @@ class TestListToolsRestAPI:
             name = "stub"
             allowed_tools = None
             mcp_info = {"server_name": "stub"}
+            available_on_public_internet = True
 
         stub_server = StubServer()
 
@@ -436,6 +437,7 @@ class TestCallToolRestAPI:
             name = "stub"
             allowed_tools = None
             mcp_info = {"server_name": "stub"}
+            available_on_public_internet = True
 
         stub_server = StubServer()
 
