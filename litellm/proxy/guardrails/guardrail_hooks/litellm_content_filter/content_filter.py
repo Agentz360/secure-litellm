@@ -10,8 +10,19 @@ import json
 import os
 import re
 from datetime import datetime
-from typing import (TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Literal,
-                    Optional, Pattern, Tuple, Union, cast)
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncGenerator,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Pattern,
+    Tuple,
+    Union,
+    cast,
+)
 
 import yaml
 from fastapi import HTTPException
@@ -20,18 +31,26 @@ from litellm import Router
 from litellm._logging import verbose_proxy_logger
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.proxy._types import UserAPIKeyAuth
-from litellm.types.utils import ModelResponseStream
+from litellm.types.utils import GuardrailTracingDetail, ModelResponseStream
 
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
     from litellm.types.utils import GenericGuardrailAPIInputs, GuardrailStatus
 
-from litellm.types.guardrails import (BlockedWord, ContentFilterAction,
-                                      ContentFilterPattern,
-                                      GuardrailEventHooks, Mode)
+from litellm.types.guardrails import (
+    BlockedWord,
+    ContentFilterAction,
+    ContentFilterPattern,
+    GuardrailEventHooks,
+    Mode,
+)
 from litellm.types.proxy.guardrails.guardrail_hooks.litellm_content_filter import (
-    BlockedWordDetection, CategoryKeywordDetection,
-    ContentFilterCategoryConfig, ContentFilterDetection, PatternDetection)
+    BlockedWordDetection,
+    CategoryKeywordDetection,
+    ContentFilterCategoryConfig,
+    ContentFilterDetection,
+    PatternDetection,
+)
 
 from .patterns import PATTERN_EXTRA_CONFIG, get_compiled_pattern
 
@@ -114,6 +133,8 @@ class ContentFilterGuardrail(CustomGuardrail):
     def __init__(
         self,
         guardrail_name: Optional[str] = None,
+        guardrail_id: Optional[str] = None,
+        policy_template: Optional[str] = None,
         patterns: Optional[List[ContentFilterPattern]] = None,
         blocked_words: Optional[List[BlockedWord]] = None,
         blocked_words_file: Optional[str] = None,
@@ -158,6 +179,8 @@ class ContentFilterGuardrail(CustomGuardrail):
         )
 
         self.guardrail_provider = "litellm_content_filter"
+        self.config_guardrail_id = guardrail_id
+        self.config_policy_template = policy_template
         self.pattern_redaction_format = (
             pattern_redaction_format or self.PATTERN_REDACTION_FORMAT
         )
@@ -306,10 +329,10 @@ class ContentFilterGuardrail(CustomGuardrail):
                     action if action else category_config_obj.default_action
                 )
 
-                # Handle conditional categories (with identifier_words + inherit_from)
-                if (
-                    category_config_obj.identifier_words
-                    and category_config_obj.inherit_from
+                # Handle conditional categories (with identifier_words + inherit_from OR identifier_words + additional_block_words)
+                if category_config_obj.identifier_words and (
+                    category_config_obj.inherit_from
+                    or category_config_obj.additional_block_words
                 ):
                     self._load_conditional_category(
                         category_name,
@@ -364,64 +387,81 @@ class ContentFilterGuardrail(CustomGuardrail):
         categories_dir: str,
     ) -> None:
         """
-        Load a conditional category that uses identifier_words + inherited block_words.
+        Load a conditional category that uses identifier_words + block_words.
+
+        Supports two patterns:
+        1. Inherit + additional: identifier_words + inherit_from + optional additional_block_words
+        2. Standalone: identifier_words + additional_block_words (no inheritance)
 
         Args:
             category_name: Name of the category
-            category_config_obj: CategoryConfig object with identifier_words and inherit_from
+            category_config_obj: CategoryConfig object with identifier_words and either inherit_from or additional_block_words
             category_action: Action to take when match is found
             severity_threshold: Minimum severity threshold
             categories_dir: Directory containing category files
         """
-        # Load the inherited category to get block words
+        block_words = []
         inherit_from = category_config_obj.inherit_from
-        if not inherit_from:
-            return
 
-        # Remove .json or .yaml extension if included
-        inherit_base = inherit_from.replace(".json", "").replace(".yaml", "")
+        # Pattern 1: Load inherited category to get base block words
+        if inherit_from:
+            # Remove .json or .yaml extension if included
+            inherit_base = inherit_from.replace(".json", "").replace(".yaml", "")
 
-        # Find the inherited category file
-        inherit_yaml_path = os.path.join(categories_dir, f"{inherit_base}.yaml")
-        inherit_json_path = os.path.join(categories_dir, f"{inherit_base}.json")
+            # Find the inherited category file
+            inherit_yaml_path = os.path.join(categories_dir, f"{inherit_base}.yaml")
+            inherit_json_path = os.path.join(categories_dir, f"{inherit_base}.json")
 
-        if os.path.exists(inherit_yaml_path):
-            inherit_file_path = inherit_yaml_path
-        elif os.path.exists(inherit_json_path):
-            inherit_file_path = inherit_json_path
-        else:
+            if os.path.exists(inherit_yaml_path):
+                inherit_file_path = inherit_yaml_path
+            elif os.path.exists(inherit_json_path):
+                inherit_file_path = inherit_json_path
+            else:
+                verbose_proxy_logger.warning(
+                    f"Category {category_name}: inherit_from '{inherit_from}' file not found at {categories_dir}"
+                )
+                verbose_proxy_logger.debug(
+                    f"Tried paths: {inherit_yaml_path}, {inherit_json_path}"
+                )
+                return
+
+            try:
+                # Load the inherited category
+                inherited_category = self._load_category_file(inherit_file_path)
+
+                # Extract block words from inherited category that meet severity threshold
+                for keyword_data in inherited_category.keywords:
+                    keyword = keyword_data["keyword"].lower()
+                    severity = keyword_data["severity"]
+                    if self._should_apply_severity(severity, severity_threshold):
+                        block_words.append(keyword)
+            except Exception as e:
+                verbose_proxy_logger.error(
+                    f"Error loading inherited category for {category_name}: {e}"
+                )
+                return
+
+        # Pattern 2 or supplement to Pattern 1: Add additional block words
+        if category_config_obj.additional_block_words:
+            block_words.extend(category_config_obj.additional_block_words)
+
+        # Ensure we have block words before storing
+        if not block_words:
             verbose_proxy_logger.warning(
-                f"Category {category_name}: inherit_from '{inherit_from}' file not found at {categories_dir}"
-            )
-            verbose_proxy_logger.debug(
-                f"Tried paths: {inherit_yaml_path}, {inherit_json_path}"
+                f"Category {category_name}: no block words found (check inherit_from or additional_block_words)"
             )
             return
 
-        try:
-            # Load the inherited category
-            inherited_category = self._load_category_file(inherit_file_path)
+        # Store the conditional category configuration
+        self.conditional_categories[category_name] = {
+            "identifier_words": category_config_obj.identifier_words,
+            "block_words": block_words,
+            "action": category_action,
+            "severity": "high",  # Combinations are always high severity
+        }
 
-            # Extract block words from inherited category that meet severity threshold
-            block_words = []
-            for keyword_data in inherited_category.keywords:
-                keyword = keyword_data["keyword"].lower()
-                severity = keyword_data["severity"]
-                if self._should_apply_severity(severity, severity_threshold):
-                    block_words.append(keyword)
-
-            # Add additional block words specific to this category
-            if category_config_obj.additional_block_words:
-                block_words.extend(category_config_obj.additional_block_words)
-
-            # Store the conditional category configuration
-            self.conditional_categories[category_name] = {
-                "identifier_words": category_config_obj.identifier_words,
-                "block_words": block_words,
-                "action": category_action,
-                "severity": "high",  # Combinations are always high severity
-            }
-
+        # Log different messages based on pattern
+        if inherit_from and category_config_obj.additional_block_words:
             verbose_proxy_logger.info(
                 f"Loaded conditional category {category_name}: "
                 f"{len(category_config_obj.identifier_words)} identifiers + "
@@ -429,9 +469,17 @@ class ContentFilterGuardrail(CustomGuardrail):
                 f"({len(category_config_obj.additional_block_words)} additional + "
                 f"{len(block_words) - len(category_config_obj.additional_block_words)} from {inherit_from})"
             )
-        except Exception as e:
-            verbose_proxy_logger.error(
-                f"Error loading inherited category for {category_name}: {e}"
+        elif inherit_from:
+            verbose_proxy_logger.info(
+                f"Loaded conditional category {category_name}: "
+                f"{len(category_config_obj.identifier_words)} identifiers + "
+                f"{len(block_words)} block words (from {inherit_from})"
+            )
+        else:
+            verbose_proxy_logger.info(
+                f"Loaded conditional category {category_name}: "
+                f"{len(category_config_obj.identifier_words)} identifiers + "
+                f"{len(block_words)} block words (standalone)"
             )
 
     def _load_category_file(self, file_path: str) -> CategoryConfig:
@@ -1308,6 +1356,48 @@ class ContentFilterGuardrail(CustomGuardrail):
                         masked_entity_count.get(category, 0) + 1
                     )
 
+    def _build_match_details(
+        self, detections: List[ContentFilterDetection]
+    ) -> List[dict]:
+        """Build match_details list from content filter detections."""
+        match_details: List[dict] = []
+        for detection in detections:
+            detail: dict = {"type": detection["type"], "action_taken": detection["action"]}
+            if detection["type"] == "pattern":
+                detail["detection_method"] = "regex"
+                detail["snippet"] = cast(PatternDetection, detection).get("pattern_name", "")
+            elif detection["type"] == "blocked_word":
+                detail["detection_method"] = "keyword"
+                detail["snippet"] = cast(BlockedWordDetection, detection).get("keyword", "")
+            elif detection["type"] == "category_keyword":
+                detail["detection_method"] = "keyword"
+                cat_det = cast(CategoryKeywordDetection, detection)
+                detail["snippet"] = cat_det.get("keyword", "")
+                detail["category"] = cat_det.get("category", "")
+            match_details.append(detail)
+        return match_details
+
+    def _get_detection_methods(self, detections: List[ContentFilterDetection]) -> str:
+        """Get comma-separated detection methods used."""
+        methods: set = set()
+        for detection in detections:
+            if detection["type"] == "pattern":
+                methods.add("regex")
+            else:
+                methods.add("keyword")
+        return ",".join(sorted(methods)) if methods else ""
+
+    def _get_patterns_checked_count(self) -> int:
+        """Get total number of patterns and keywords that were evaluated."""
+        return len(self.compiled_patterns) + len(self.blocked_words) + len(self.category_keywords)
+
+    def _get_policy_templates(self) -> Optional[str]:
+        """Get comma-separated policy template names from loaded categories."""
+        if not self.loaded_categories:
+            return None
+        names = [cat.description or cat.category_name for cat in self.loaded_categories.values()]
+        return ", ".join(names) if names else None
+
     def _log_guardrail_information(
         self,
         request_data: dict,
@@ -1348,6 +1438,13 @@ class ContentFilterGuardrail(CustomGuardrail):
             end_time=datetime.now().timestamp(),
             duration=(datetime.now() - start_time).total_seconds(),
             masked_entity_count=masked_entity_count,
+            tracing_detail=GuardrailTracingDetail(
+                guardrail_id=self.config_guardrail_id or self.guardrail_name,
+                policy_template=self.config_policy_template or self._get_policy_templates(),
+                detection_method=self._get_detection_methods(detections) if detections else None,
+                match_details=self._build_match_details(detections) if detections else None,
+                patterns_checked=self._get_patterns_checked_count(),
+            ),
         )
 
     async def apply_guardrail(
@@ -1518,7 +1615,8 @@ class ContentFilterGuardrail(CustomGuardrail):
 
     @staticmethod
     def get_config_model():
-        from litellm.types.proxy.guardrails.guardrail_hooks.litellm_content_filter import \
-            LitellmContentFilterGuardrailConfigModel
+        from litellm.types.proxy.guardrails.guardrail_hooks.litellm_content_filter import (
+            LitellmContentFilterGuardrailConfigModel,
+        )
 
         return LitellmContentFilterGuardrailConfigModel
