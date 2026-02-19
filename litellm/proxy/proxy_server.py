@@ -345,6 +345,9 @@ from litellm.proxy.management_endpoints.common_utils import (
     _user_has_admin_privileges,
     admin_can_invite_user,
 )
+from litellm.proxy.management_endpoints.compliance_endpoints import (
+    router as compliance_router,
+)
 from litellm.proxy.management_endpoints.cost_tracking_settings import (
     router as cost_tracking_settings_router,
 )
@@ -5071,10 +5074,6 @@ async def async_data_generator(
             response=response,
             request_data=request_data,
         ):
-            verbose_proxy_logger.debug(
-                "async_data_generator: received streaming chunk - {}".format(chunk)
-            )
-
             ### CALL HOOKS ### - modify outgoing data
             chunk = await proxy_logging_obj.async_post_call_streaming_hook(
                 user_api_key_dict=user_api_key_dict,
@@ -12467,6 +12466,7 @@ app.include_router(user_agent_analytics_router)
 app.include_router(enterprise_router)
 app.include_router(ui_discovery_endpoints_router)
 app.include_router(agent_endpoints_router)
+app.include_router(compliance_router)
 app.include_router(a2a_router)
 app.include_router(access_group_router)
 ########################################################
